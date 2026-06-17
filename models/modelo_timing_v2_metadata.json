@@ -1,0 +1,24 @@
+{
+  "umbral": 0.5768263212587227,
+  "auc_test": 0.9242502040345077,
+  "features": [
+    "dias_desde_ultima_op",
+    "freq_30d",
+    "freq_90d",
+    "monto_prom_90d",
+    "CIIU_BUC",
+    "Segmento",
+    "Subsegmento",
+    "dia_mes",
+    "mes",
+    "semana_a\u00f1o"
+  ],
+  "cat_features": [
+    "CIIU_BUC",
+    "Segmento",
+    "Subsegmento"
+  ],
+  "fecha_corte_train": "2025-01-01",
+  "recall_en_umbral": 0.8350674759332133,
+  "precision_en_umbral": 0.43743157943772853
+}
