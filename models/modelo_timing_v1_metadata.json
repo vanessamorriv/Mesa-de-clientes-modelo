@@ -1,6 +1,4 @@
 {
-  "umbral": 0.5768263212587227,
-  "auc_test": 0.9242502040345077,
   "features": [
     "dias_desde_ultima_op",
     "freq_30d",
@@ -19,6 +17,7 @@
     "Subsegmento"
   ],
   "fecha_corte_train": "2025-01-01",
-  "recall_en_umbral": 0.8350674759332133,
-  "precision_en_umbral": 0.43743157943772853
+  "auc_test": 0.9241,
+  "n_train": 2848032,
+  "n_test": 785664
 }
