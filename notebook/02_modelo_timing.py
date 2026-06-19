@@ -1,157 +1,146 @@
 import pandas as pd
 import numpy as np
-import pickle
-import json
-import os
 import lightgbm as lgb
-from sklearn.metrics import roc_auc_score, precision_recall_curve
+import os
+import gc
+from workalendar.america import Colombia
 
 BASE      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PROCESSED = os.path.join(BASE, 'data', 'processed') + os.sep
 MODELS    = os.path.join(BASE, 'models') + os.sep
-os.makedirs(MODELS, exist_ok=True)
 
-# ── 1. Cargar datos ───────────────────────────────────────────────
-print("Cargando datos...")
-cols_necesarias = ['NIT', 'Fecha', 'Monto_Total_', 'Segmento', 'Subsegmento', 'CIIU_BUC']
-df = pd.read_parquet(PROCESSED + 'dataset_consolidado.parquet', columns=cols_necesarias)
-trm_usd_diario = pd.read_parquet(PROCESSED + 'trm_usd_diario.parquet')
-df_sorted      = df.sort_values(['NIT', 'Fecha'])
+CUPO_DIARIO = 40
+UMBRAL_HIPERACTIVO = 45
 
-# ── 2. Construir panel semanal ────────────────────────────────────
-print("Construyendo panel...")
-fecha_min = df['Fecha'].min()
-fecha_max = df['Fecha'].max()
-
-fechas_corte_global = pd.date_range(
-    fecha_min, fecha_max - pd.Timedelta(days=7), freq='W-MON'
-).values
-n_fechas = len(fechas_corte_global)
-
-resultados = []
-for nit, grupo in df_sorted.groupby('NIT'):
-    fechas_ops = grupo['Fecha'].values.astype('datetime64[ns]')
-    montos     = grupo['Monto_Total_'].values
-
-    idx_hasta_corte = np.searchsorted(fechas_ops, fechas_corte_global, side='right')
-    idx_30          = np.searchsorted(fechas_ops, fechas_corte_global - np.timedelta64(30, 'D'), side='right')
-    idx_90          = np.searchsorted(fechas_ops, fechas_corte_global - np.timedelta64(90, 'D'), side='right')
-    idx_label       = np.searchsorted(fechas_ops, fechas_corte_global + np.timedelta64(7, 'D'),  side='right')
-
-    dias_desde_ultima = np.full(n_fechas, np.nan)
-    tiene_historia    = idx_hasta_corte > 0
-    idx_prev          = np.clip(idx_hasta_corte - 1, 0, None)
-    ultimas_fechas    = fechas_ops[idx_prev]
-    dias_desde_ultima[tiene_historia] = (
-        (fechas_corte_global[tiene_historia] - ultimas_fechas[tiene_historia])
-        / np.timedelta64(1, 'D')
-    )
-
-    freq_30d = idx_hasta_corte - idx_30
-    freq_90d = idx_hasta_corte - idx_90
-
-    cum_montos   = np.concatenate([[0], np.cumsum(montos)])
-    suma_90      = cum_montos[idx_hasta_corte] - cum_montos[idx_90]
-    monto_prom_90d = np.divide(suma_90, freq_90d,
-                                out=np.full(n_fechas, np.nan),
-                                where=freq_90d > 0)
-
-    label = (idx_label > idx_hasta_corte).astype(int)
-
-    resultados.append(pd.DataFrame({
-        'NIT':                nit,
-        'fecha_corte':        fechas_corte_global,
-        'dias_desde_ultima_op': dias_desde_ultima,
-        'freq_30d':           freq_30d,
-        'freq_90d':           freq_90d,
-        'monto_prom_90d':     monto_prom_90d,
-        'label':              label,
-    }))
-
-panel = pd.concat(resultados, ignore_index=True)
-
-# ── 3. Agregar variables estáticas y calendario ───────────────────
-clientes_estatico = (df[['NIT', 'Segmento', 'Subsegmento', 'CIIU_BUC']]
-                     .drop_duplicates(subset='NIT'))
-panel = panel.merge(clientes_estatico, on='NIT', how='left')
-panel['dia_mes']    = panel['fecha_corte'].dt.day
-panel['mes']        = panel['fecha_corte'].dt.month
-panel['semana_año'] = panel['fecha_corte'].dt.strftime('%V').astype(int)
-
-# ── 4. Guardar panel para que lo use el script de producto ────────
-panel.to_parquet(PROCESSED + 'panel_semanal.parquet', index=False)
-print(f" Panel guardado: {panel.shape}")
-
-# ── 5. Reducir memoria antes del split ───────────────────────────
-# Convertir columnas numéricas a tipos más livianos
-for col in ['freq_30d', 'freq_90d', 'dia_mes', 'mes', 'semana_año', 'label']:
-    panel[col] = panel[col].astype('int16')
-panel['dias_desde_ultima_op'] = panel['dias_desde_ultima_op'].astype('float32')
-panel['monto_prom_90d']       = panel['monto_prom_90d'].astype('float32')
-
-print(f"Memoria panel: {panel.memory_usage(deep=True).sum() / 1e6:.1f} MB")
-
-# ── 6. Train / Test split SIN .copy() ────────────────────────────
-FECHA_CORTE_TRAIN = pd.Timestamp('2025-01-01')
-mask_train = panel['fecha_corte'] < FECHA_CORTE_TRAIN
-
-features     = ['dias_desde_ultima_op', 'freq_30d', 'freq_90d', 'monto_prom_90d',
-                'CIIU_BUC', 'Segmento', 'Subsegmento', 'dia_mes', 'mes', 'semana_año']
+features = ['dias_desde_ultima_op', 'freq_30d', 'freq_90d', 'monto_prom_90d',
+            'CIIU_BUC', 'Segmento', 'Subsegmento',
+            'dia_semana', 'dia_mes', 'mes',
+            'TRM_USD', 'variacion_trm_7d']
 cat_features = ['CIIU_BUC', 'Segmento', 'Subsegmento']
 
-# Extraer directamente X e y sin guardar train/test completos
-X_train = panel.loc[mask_train,  features].copy()
-y_train = panel.loc[mask_train,  'label']
-X_test  = panel.loc[~mask_train, features].copy()
-y_test  = panel.loc[~mask_train, 'label']
-
+# ── 1. Cargar panel completo (para entrenar) ────────────────────────────
+print("Cargando panel diario...")
+panel = pd.read_parquet(PROCESSED + 'panel_diario_completo.parquet')
+panel['fecha_corte'] = pd.to_datetime(panel['fecha_corte'])
 for col in cat_features:
-    X_train[col] = X_train[col].astype('category')
-    X_test[col]  = X_test[col].astype('category')
+    panel[col] = panel[col].astype('category')
 
-print(f"Train: {X_train.shape} | Test: {X_test.shape}")
-# ── 7. Entrenar ───────────────────────────────────────────────────
-print("Entrenando modelo timing...")
+FECHA_ANCLA = panel['fecha_corte'].max()
+print(f"Fecha ancla (último dato real disponible): {FECHA_ANCLA.date()}")
 
-# Liberar memoria antes de entrenar
-import gc
-del panel
+# ── 2. Calendario hábil colombiano — primera semana de junio ────────────
+print("Construyendo calendario para primera semana de junio...")
+cal = Colombia()
+festivos_2026 = [pd.Timestamp(d) for d, _ in cal.holidays(2026)]
+
+dias_junio = pd.bdate_range('2026-06-01', '2026-06-10', freq='C',
+                             holidays=festivos_2026)
+dias_junio = pd.DatetimeIndex(dias_junio)[:5]
+print(f"Días hábiles primera semana de junio: {[d.date() for d in dias_junio]}")
+
+# ── 3. Construir features "como si hoy fuera el día ancla" ──────────────
+df_ops = pd.read_parquet(PROCESSED + 'dataset_consolidado.parquet',
+                          columns=['Fecha', 'NIT', 'Monto_Total_'])
+df_ops['Fecha'] = pd.to_datetime(df_ops['Fecha'])
+df_ops = df_ops.sort_values('Fecha').reset_index(drop=True)
+
+trm = pd.read_parquet(PROCESSED + 'trm_usd_diario.parquet')
+trm['Fecha'] = pd.to_datetime(trm['Fecha'])
+trm_ancla_row = trm[trm['Fecha'] == FECHA_ANCLA]
+if len(trm_ancla_row) == 0:
+    trm_ancla_row = trm[trm['Fecha'] <= FECHA_ANCLA].sort_values('Fecha').iloc[[-1]]
+trm_ancla = trm_ancla_row.iloc[0]
+print(f"TRM usada (fecha {trm_ancla['Fecha'].date()}): {trm_ancla['TRM_USD']}")
+
+attrs = panel[['NIT', 'Segmento', 'Subsegmento', 'CIIU_BUC']].drop_duplicates(subset='NIT')
+nits_activos = df_ops['NIT'].unique()
+
+hace_30d = FECHA_ANCLA - pd.Timedelta(days=30)
+hace_90d = FECHA_ANCLA - pd.Timedelta(days=90)
+
+w30 = df_ops[(df_ops['Fecha'] >= hace_30d) & (df_ops['Fecha'] <= FECHA_ANCLA)]
+w90 = df_ops[(df_ops['Fecha'] >= hace_90d) & (df_ops['Fecha'] <= FECHA_ANCLA)]
+
+freq30    = w30.groupby('NIT').size()
+freq90    = w90.groupby('NIT').size()
+monto90   = w90.groupby('NIT')['Monto_Total_'].mean()
+ultima_op = df_ops.groupby('NIT')['Fecha'].max()
+
+base = pd.DataFrame({'NIT': nits_activos})
+base['freq_30d'] = base['NIT'].map(freq30).fillna(0).astype(int)
+base['freq_90d'] = base['NIT'].map(freq90).fillna(0).astype(int)
+base = base[base['freq_90d'] < UMBRAL_HIPERACTIVO].copy()
+base['monto_prom_90d'] = base['NIT'].map(monto90).fillna(0)
+base['ultima_op'] = base['NIT'].map(ultima_op)
+base['dias_desde_ultima_op'] = (FECHA_ANCLA - base['ultima_op']).dt.days.fillna(999).astype(int)
+base = base.drop(columns=['ultima_op'])
+base = base.merge(attrs, on='NIT', how='left')
+
+# Una fila por cliente por cada día hábil de la primera semana de junio
+bloques_junio = []
+for fecha in dias_junio:
+    b = base.copy()
+    b['fecha_corte']      = fecha
+    b['dia_semana']       = fecha.weekday()
+    b['dia_mes']          = fecha.day
+    b['mes']              = fecha.month
+    b['TRM_USD']          = trm_ancla['TRM_USD']
+    b['variacion_trm_7d'] = trm_ancla['variacion_trm_7d']
+    bloques_junio.append(b)
+
+panel_junio = pd.concat(bloques_junio, ignore_index=True)
+for col in cat_features:
+    panel_junio[col] = panel_junio[col].astype('category')
+
+print(f"Filas construidas para primera semana de junio: {panel_junio.shape}")
+
+del df_ops, w30, w90
 gc.collect()
 
-modelo = lgb.LGBMClassifier(
-    objective='binary',
-    is_unbalance=True,
-    n_estimators=300,
-    learning_rate=0.05,
-    random_state=42,
-    # Parámetros para reducir uso de RAM
-    max_bin=63,          # por defecto 255 — reduce memoria ~4x
-    num_leaves=31,       # por defecto 31, dejarlo así
-    min_data_in_leaf=50, # evita hojas muy pequeñas
-    force_col_wise=True  # más eficiente en memoria que row-wise
-)
+# ── 4. Entrenar modelo final con TODO el panel disponible (hasta mayo) ──
+print("\nEntrenando modelo final con todos los datos disponibles (hasta mayo 2026)...")
 
-modelo.fit(X_train, y_train, categorical_feature=cat_features)
-# ── 8. Evaluar ─────────────────────────────────────────────────
-print("\nEvaluando modelo timing...")
-proba_test = modelo.predict_proba(X_test)[:, 1]
-auc = roc_auc_score(y_test, proba_test)
-print(f"AUC: {auc:.4f}")
-
-# ── 9. Guardar modelo y metadata ──────────────────────────────
-with open(MODELS + 'modelo_timing_v1.pkl', 'wb') as f:
-    pickle.dump(modelo, f)
-
-metadata = {
-    'features': features,
-    'cat_features': cat_features,
-    'fecha_corte_train': str(FECHA_CORTE_TRAIN.date()),
-    'auc_test': round(auc, 4),
-    'n_train': len(X_train),
-    'n_test': len(X_test),
+PARAMS_LGB = {
+    'objective': 'binary', 'is_unbalance': True, 'learning_rate': 0.05,
+    'max_bin': 63, 'num_leaves': 31, 'min_data_in_leaf': 50,
+    'force_col_wise': True, 'verbose': -1, 'seed': 42,
 }
-with open(MODELS + 'modelo_timing_v1_metadata.json', 'w') as f:
-    json.dump(metadata, f, indent=2)
 
-print(f"\n Guardado: {MODELS}modelo_timing_v1.pkl")
-print(f" Guardado: {MODELS}modelo_timing_v1_metadata.json")
+train_set = lgb.Dataset(
+    panel[features], label=panel['label'],
+    categorical_feature=cat_features, free_raw_data=True
+)
+modelo_final = lgb.train(PARAMS_LGB, train_set, num_boost_round=300)
+
+del train_set, panel
+gc.collect()
+
+# ── 5. Predecir primera semana de junio ──────────────────────────────────
+proba_junio = modelo_final.predict(panel_junio[features])
+panel_junio['prob_opera_manana'] = proba_junio
+
+# ── 6. Priorizar por día (cupo por demanda, igual que siempre) ──────────
+lista_junio = []
+for fecha in sorted(panel_junio['fecha_corte'].unique()):
+    grupo   = panel_junio[panel_junio['fecha_corte'] == fecha].copy()
+    demanda = grupo.groupby('Segmento', observed=True)['prob_opera_manana'].sum()
+    props   = demanda / demanda.sum()
+    cupos   = (props * CUPO_DIARIO).round().astype(int).clip(lower=1)
+
+    for seg, cupo in cupos.items():
+        sub = grupo[grupo['Segmento'] == seg].sort_values(
+              'prob_opera_manana', ascending=False)
+        lista_junio.append(sub.head(cupo))
+
+lista_junio = pd.concat(lista_junio, ignore_index=True)
+lista_junio['fecha_prediccion'] = lista_junio['fecha_corte']
+lista_junio['dia_llamada']      = lista_junio['fecha_corte'] + pd.Timedelta(days=1)
+
+cols_out = ['fecha_corte', 'dia_llamada', 'NIT', 'Segmento', 'prob_opera_manana']
+lista_junio[cols_out].to_csv(MODELS + 'predicciones_primera_semana_junio_2026.csv', index=False)
+
+print(f"\nPredicciones primera semana de junio 2026:")
+print(f"  Días con lista:     {lista_junio['fecha_corte'].nunique()}")
+print(f"  Clientes por día:   {lista_junio.groupby('fecha_corte').size().mean():.0f} promedio")
+print(f"  Total predicciones: {len(lista_junio)}")
+print(f"\nGuardado: {MODELS}predicciones_primera_semana_junio_2026.csv")
