@@ -18,6 +18,10 @@ df             = pd.read_parquet(PROCESSED + 'dataset_consolidado.parquet')
 panel          = pd.read_parquet(PROCESSED + 'panel_semanal.parquet')
 trm_usd_diario = pd.read_parquet(PROCESSED + 'trm_usd_diario.parquet')
 
+# ── 1b. Filtrar solo operaciones en USD ───────────────────────────
+df = df[df['Moneda'].str.contains('USD', na=False)].copy()
+print(f"Operaciones en USD: {df.shape[0]}")
+
 # ── 2. Agrupar productos ──────────────────────────────────────────
 def agrupar_producto(p):
     return 'OTROS' if p in ('OPCIONES', 'SWAPS') else p
@@ -142,7 +146,10 @@ for col in cat_features_prod:
 
 # ── 9. Entrenar con pesos balanceados ─────────────────────────────
 print("Entrenando modelo producto...")
-pesos_suaves = {0: 3.0, 1: 1.0, 2: 2.0, 3: 4.0, 4: 1.0}
+# Clases (orden alfabético de LabelEncoder): 0=FIX, 1=FORWARD, 2=NEXT DAY, 3=OTROS, 4=SPOT
+# FORWARD, NEXT DAY y SPOT reciben el mismo peso para no favorecer
+# artificialmente a una sobre otra dentro de ese grupo.
+pesos_suaves = {0: 3.0, 1: 1.0, 2: 1.0, 3: 4.0, 4: 1.0}
 
 modelo = lgb.LGBMClassifier(
     objective='multiclass',
@@ -172,7 +179,8 @@ metadata = {
     'features':          features_prod,
     'cat_features':      cat_features_prod,
     'fecha_corte_train': '2025-01-01',
-    'balanceo':          'FIX=3, FORWARD=1, NEXT DAY=2, OTROS=4, SPOT=1',
+    'balanceo':          'FIX=3, FORWARD=1, NEXT DAY=1, OTROS=4, SPOT=1',
+    'moneda':            'Solo operaciones en USD',
     'trm':               'TRM_USD + variacion_trm_7d incluidas',
 }
 with open(MODELS + 'modelo_producto_v4_metadata.json', 'w') as f:
