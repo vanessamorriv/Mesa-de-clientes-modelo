@@ -1,0 +1,7 @@
+{
+"meta":{"test_sets":[],"test_metrics":[],"learn_metrics":[{"best_value":"Min","name":"Quantile:alpha=0.1"}],"launch_mode":"Train","parameters":"","iteration_count":200,"learn_sets":["learn"],"name":"experiment"},
+"iterations":[
+{"learn":[0.4031017205],"iteration":0,"passed_time":0.5379761149,"remaining_time":107.0572469},
+{"learn":[0.3911777639],"iteration":1,"passed_time":0.990239427,"remaining_time":98.03370328},
+{"learn":[0.3801246519],"iteration":2,"passed_time":1.560672587,"remaining_time":102.4841665}
+]}

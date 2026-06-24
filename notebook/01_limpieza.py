@@ -15,6 +15,7 @@ clientes    = pd.read_excel(RAW + 'clientes.xlsx')
 trm_usd     = pd.read_csv(RAW + 'trm_usd.csv', sep=None, engine='python')
 trm_eur     = pd.read_excel(RAW + 'trm_eur.xlsx', skiprows=[1])
 ciiu_desc   = pd.read_excel(RAW + 'ciiu.xlsx')
+traders     = pd.read_excel(RAW + 'traiders.xlsx')
 
 # ── 2. Limpiar fechas de operaciones ─────────────────────────────
 operaciones['Fecha'] = (pd.to_timedelta(operaciones['Fecha'], unit='D')
@@ -53,6 +54,14 @@ trm_eur['Fecha']   = pd.to_datetime(trm_eur['Fecha'], dayfirst=True, errors='coe
 trm_eur['TRM_EUR'] = trm_eur['TRM_EUR'].apply(parse_numero_es)
 trm_eur = trm_eur.dropna(subset=['Fecha'])
 
+# ── 4b. Limpiar base de traders (NIT -> Trader asignado) ──────────
+print("Limpiando base de traders...")
+traders = traders.rename(columns={'ID': 'NIT'})
+traders = traders[['NIT', 'Trader']].drop_duplicates(subset='NIT')
+traders['Trader'] = traders['Trader'].replace({'Sin informacion': 'No asignado'})
+print(f"  Clientes con trader: {traders['NIT'].nunique()}")
+print(f"  Traders/canales únicos: {traders['Trader'].nunique()}")
+
 # ── 5. Merge principal ───────────────────────────────────────────
 print("Haciendo merge...")
 df = operaciones.merge(clientes.drop(columns=['IDE']),
@@ -61,6 +70,8 @@ df = df.merge(ciiu_desc,
               left_on='CIIU_BUC', right_on='COD_ACT_CIIU_NOCLI', how='left')
 df = df.merge(trm_usd_diario[['Fecha', 'TRM_USD']], on='Fecha', how='left')
 df = df.merge(trm_eur, on='Fecha', how='left')
+df = df.merge(traders, on='NIT', how='left')
+df['Trader'] = df['Trader'].fillna('No asignado')
 
 # ── 6. Limpieza de columnas duplicadas ───────────────────────────
 df = df.drop(columns=['TipoIDC_y', 'ID', 'COD_ACT_CIIU_NOCLI'])
@@ -82,6 +93,8 @@ print(f"Sin match cliente:    {df['Segmento'].isna().sum()}")
 print(f"Sin TRM USD:          {df['TRM_USD'].isna().sum()}")
 print(f"   Sin TRM aplicable:   {df['TRM_aplicable'].isna().sum()} "
       f"({df['TRM_aplicable'].isna().mean()*100:.2f}%) — monedas distintas USD/EUR")
+print(f"Sin trader asignado:  {(df['Trader'] == 'No asignado').sum()} "
+      f"({(df['Trader'] == 'No asignado').mean()*100:.2f}%)")
 
 # ── 8. Guardar ───────────────────────────────────────────────────
 out = PROCESSED + 'dataset_consolidado.parquet'
@@ -90,5 +103,10 @@ df.to_parquet(out, index=False)
 # Guardar también trm_usd_diario para que lo usen los siguientes scripts
 trm_usd_diario.to_parquet(PROCESSED + 'trm_usd_diario.parquet', index=False)
 
+# Guardar tabla NIT -> Trader por separado, para que 02_modelo_timing.py
+# la use al final sin tener que tocar el dataset_consolidado completo
+traders.to_parquet(PROCESSED + 'traders.parquet', index=False)
+
 print(f"\n Guardado: {out}")
 print(" Guardado: ../data/processed/trm_usd_diario.parquet")
+print(" Guardado: ../data/processed/traders.parquet")
